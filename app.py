@@ -98,7 +98,7 @@ CONFIG = {
     "API": {
         "IS_CUSTOM_SSO": os.environ.get("IS_CUSTOM_SSO", "false").lower() == "true",
         "BASE_URL": "https://grok.com",
-        "API_KEY": os.environ.get("API_KEY", "sk-123456"),
+        "API_KEY": os.environ.get("API_KEY", ""),
         "SIGNATURE_COOKIE": None,
         "PICGO_KEY": os.environ.get("PICGO_KEY") or None,
         "TUMY_KEY": os.environ.get("TUMY_KEY") or None,

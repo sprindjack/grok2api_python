@@ -5,12 +5,15 @@ import time
 import base64
 import sys
 import inspect
+import threading
 from loguru import logger
 
 import requests
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, request, Response, jsonify, stream_with_context, render_template
 from curl_cffi import requests as curl_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
+import asyncio
+from flask import current_app
 
 
 class Logger:
@@ -159,6 +162,10 @@ class AuthTokenManager:
         }
         self.token_reset_switch = False
         self.token_reset_timer = None
+        self.rate_limit_manager = RateLimitManager()
+        
+        # 添加一个状态同步器，每10分钟自动更新一次令牌状态
+        self.status_sync_timer = None
 
     def add_token(self, token):
         sso = token.split("sso=")[1].split(";")[0]
@@ -379,6 +386,205 @@ class AuthTokenManager:
     def get_token_status_map(self):
         return self.token_status_map
     
+    def sync_tokens_with_rate_limits(self):
+        """与Grok API同步令牌状态"""
+        try:
+            # 如果没有令牌可用，则跳过
+            if not self.get_all_tokens():
+                return
+                
+            # 获取第一个可用令牌
+            first_token = self.get_all_tokens()[0]
+            
+            # 获取所有模式的速率限制
+            rate_limits = self.rate_limit_manager.get_all_rate_limits(first_token)
+            
+            # 更新令牌状态映射
+            for kind, data in rate_limits.items():
+                model_name = self.rate_limit_manager.kind_to_model.get(kind)
+                if not model_name:
+                    continue
+                    
+                remaining = data.get("remainingQueries", 0)
+                
+                # 获取该令牌的SSO
+                try:
+                    sso = first_token.split("sso=")[1].split(";")[0]
+                except:
+                    continue
+                    
+                # 更新令牌状态
+                if sso in self.token_status_map and model_name in self.token_status_map[sso]:
+                    if remaining <= 0:
+                        self.token_status_map[sso][model_name]["isValid"] = False
+                        if not self.token_status_map[sso][model_name]["invalidatedTime"]:
+                            self.token_status_map[sso][model_name]["invalidatedTime"] = int(time.time() * 1000)
+                    else:
+                        self.token_status_map[sso][model_name]["isValid"] = True
+                        self.token_status_map[sso][model_name]["invalidatedTime"] = None
+            
+            # 记录状态更新
+            logger.info("令牌状态已与Grok API同步", "TokenManager")
+        except Exception as e:
+            logger.error(f"令牌状态同步失败: {str(e)}", "TokenManager")
+    
+    def start_status_sync_timer(self):
+        """启动状态同步计时器"""
+        def run_sync_timer():
+            while True:
+                time.sleep(10 * 60)  # 每10分钟执行一次
+                self.sync_tokens_with_rate_limits()
+        
+        if not self.status_sync_timer:
+            self.status_sync_timer = threading.Thread(target=run_sync_timer)
+            self.status_sync_timer.daemon = True
+            self.status_sync_timer.start()
+            logger.info("令牌状态同步器已启动", "TokenManager")
+
+class RateLimitManager:
+    """管理 Grok API 的速率限制信息，提供实时查询和缓存功能"""
+    
+    def __init__(self):
+        self.rate_limits_cache = {}
+        self.last_update_time = {}
+        self.cache_ttl = 5 * 60  # 缓存有效期5分钟
+        
+        # 模式与中文名称的映射
+        self.mode_labels = {
+            "DEFAULT": "标准",
+            "REASONING": "思考",
+            "DEEPSEARCH": "深度"
+        }
+        
+        # 模式与模型名称的映射
+        self.kind_to_model = {
+            "DEFAULT": "grok-3",
+            "REASONING": "grok-3-reasoning",
+            "DEEPSEARCH": "grok-3-deepsearch"
+        }
+        
+        # 初始化缓存
+        for kind in self.mode_labels.keys():
+            self.rate_limits_cache[kind] = {
+                "remainingQueries": 0,
+                "waitTimeSeconds": 0,
+                "lastUpdated": 0
+            }
+    
+    def fetch_rate_limit(self, token, kind):
+        """从 Grok API 获取特定模式的速率限制信息"""
+        try:
+            model_name = self.kind_to_model.get(kind, "grok-3")
+            
+            headers = {
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+                "Cookie": token
+            }
+            
+            proxy_options = Utils.get_proxy_options()
+            
+            response = curl_requests.post(
+                f"{CONFIG['API']['BASE_URL']}/rest/rate-limits",
+                headers=headers,
+                data=json.dumps({
+                    "requestKind": kind,
+                    "modelName": model_name.split("-")[0] + "-" + model_name.split("-")[1]  # 取 grok-3 部分
+                }),
+                impersonate="chrome120",
+                **proxy_options
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                # 更新缓存
+                self.rate_limits_cache[kind] = {
+                    "remainingQueries": data.get("remainingQueries", 0),
+                    "waitTimeSeconds": data.get("waitTimeSeconds", 0),
+                    "lastUpdated": int(time.time())
+                }
+                self.last_update_time[kind] = int(time.time())
+                return data
+            else:
+                logger.error(f"获取 {kind} 模式的速率限制失败: {response.status_code}", "RateLimit")
+                return None
+        except Exception as e:
+            logger.error(f"速率限制查询异常: {str(e)}", "RateLimit")
+            return None
+    
+    def get_all_rate_limits(self, token):
+        """获取所有模式的速率限制信息"""
+        current_time = int(time.time())
+        results = {}
+        
+        # 检查是否需要刷新缓存
+        needs_refresh = False
+        for kind in self.mode_labels.keys():
+            last_update = self.last_update_time.get(kind, 0)
+            if current_time - last_update > self.cache_ttl:
+                needs_refresh = True
+                break
+        
+        # 如果不需要刷新，直接返回缓存
+        if not needs_refresh:
+            return self.rate_limits_cache
+        
+        # 需要刷新，逐个获取
+        for kind in self.mode_labels.keys():
+            result = self.fetch_rate_limit(token, kind)
+            if result:
+                results[kind] = result
+            else:
+                # 如果获取失败，使用缓存的数据
+                results[kind] = self.rate_limits_cache.get(kind, {
+                    "remainingQueries": 0,
+                    "waitTimeSeconds": 0,
+                    "lastUpdated": current_time
+                })
+        
+        return results
+    
+    def format_wait_time(self, seconds):
+        """格式化等待时间，与浏览器脚本保持一致"""
+        if seconds <= 0:
+            return "0m"
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        
+        if hours > 0 and minutes > 0:
+            return f"{hours}h{minutes}m"
+        elif hours > 0:
+            return f"{hours}h"
+        else:
+            return f"{minutes}m"
+    
+    def get_summary(self):
+        """获取所有模式的总结信息"""
+        total_remaining = 0
+        results = {}
+        
+        for kind, info in self.rate_limits_cache.items():
+            remaining = info.get("remainingQueries", 0)
+            wait_time = info.get("waitTimeSeconds", 0)
+            total_remaining += remaining
+            
+            kind_label = self.mode_labels.get(kind, kind)
+            if remaining > 0:
+                results[kind_label] = f"剩余: {remaining}"
+            else:
+                results[kind_label] = f"等待: {self.format_wait_time(wait_time)}"
+        
+        # 状态指示
+        status = "red"  # 默认红色
+        if total_remaining > 0:
+            status = "yellow" if total_remaining < 5 else "green"
+        
+        return {
+            "totalRemaining": total_remaining,
+            "details": results,
+            "status": status
+        }
+
 class Utils:
     @staticmethod
     def organize_search_results(search_results):
@@ -715,9 +921,8 @@ def handle_image_response(image_url):
         image_content_type = image_base64_response.headers.get('content-type', 'image/jpeg')
         return f"![image](data:{image_content_type};base64,{base64_image})"
     
-    logger.info("开始上传图床", "Server")
-    
-    if CONFIG["API"]["PICGO_KEY"]:
+
+    elif CONFIG["API"]["PICGO_KEY"]:
         files = {'source': ('image.jpg', image_buffer, 'image/jpeg')}
         headers = {
             "X-API-Key": CONFIG["API"]["PICGO_KEY"]
@@ -861,6 +1066,9 @@ def initialization():
     
     logger.info(f"成功加载令牌: {json.dumps(token_manager.get_all_tokens(), indent=2)}", "Server")
     logger.info(f"令牌加载完成，共加载: {len(token_manager.get_all_tokens())}个令牌", "Server")
+    
+    # 启动令牌状态同步器
+    token_manager.start_status_sync_timer()
     
     if CONFIG["API"]["PROXY"]:
         logger.info(f"代理已设置: {CONFIG['API']['PROXY']}", "Server")
@@ -1036,6 +1244,78 @@ def chat_completions():
                 "type": "server_error"
             }
         }), 500
+
+@app.route('/api/rate-limits', methods=['GET'])
+def get_rate_limits():
+    """获取当前账号的速率限制情况"""
+    auth_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    
+    if CONFIG["API"]["IS_CUSTOM_SSO"]:
+        token_cookie = f"sso={auth_token};sso-rw={auth_token}"
+    elif auth_token != CONFIG["API"]["API_KEY"]:
+        return jsonify({"error": 'Unauthorized'}), 401
+    else:
+        # 使用系统当前的令牌
+        token_cookie = CONFIG["API"]["SIGNATURE_COOKIE"]
+    
+    if not token_cookie:
+        return jsonify({"error": "没有可用的令牌"}), 400
+    
+    try:
+        # 获取所有模式的速率限制
+        rate_limits = token_manager.rate_limit_manager.get_all_rate_limits(token_cookie)
+        summary = token_manager.rate_limit_manager.get_summary()
+        
+        return jsonify({
+            "rateLimits": rate_limits,
+            "summary": summary
+        }), 200
+    except Exception as e:
+        logger.error(f"获取速率限制失败: {str(e)}", "Server")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/v1/token-status', methods=['GET'])
+def get_token_status():
+    """获取所有令牌的详细状态，包括API实时限制信息"""
+    auth_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if auth_token != CONFIG["API"]["API_KEY"]:
+        return jsonify({"error": 'Unauthorized'}), 401
+        
+    try:
+        # 获取状态映射
+        status_map = token_manager.get_token_status_map()
+        
+        # 如果有足够的令牌，尝试同步状态
+        if token_manager.get_all_tokens():
+            token_manager.sync_tokens_with_rate_limits()
+            
+        # 获取速率限制信息
+        if token_manager.get_all_tokens():
+            first_token = token_manager.get_all_tokens()[0]
+            rate_limits = token_manager.rate_limit_manager.get_all_rate_limits(first_token)
+            rate_summary = token_manager.rate_limit_manager.get_summary()
+        else:
+            rate_limits = {}
+            rate_summary = {"totalRemaining": 0, "details": {}, "status": "red"}
+            
+        # 获取所有模型的详细剩余容量
+        remaining_capacity = token_manager.get_remaining_token_request_capacity()
+        
+        return jsonify({
+            "tokenStatus": status_map,
+            "rateLimits": rate_limits,
+            "rateSummary": rate_summary,
+            "remainingCapacity": remaining_capacity,
+            "totalTokens": len(token_manager.get_all_tokens())
+        }), 200
+    except Exception as e:
+        logger.error(f"获取令牌状态失败: {str(e)}", "Server")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def status_page():
+    """显示SSO令牌状态监控页面"""
+    return render_template('status.html')
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')

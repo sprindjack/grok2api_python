@@ -28,7 +28,7 @@ const CONFIG = {
         GROK2_CONCURRENCY_LEVEL: process.env.GROK2_CONCURRENCY_LEVEL || 4,
         IS_CUSTOM_SSO: process.env.IS_CUSTOM_SSO == undefined ? false : process.env.IS_CUSTOM_SSO == 'true',
         BASE_URL: "https://grok.com",
-        API_KEY: process.env.API_KEY || "sk-123456",
+        API_KEY: process.env.API_KEY || "",
         SIGNATURE_COOKIE: null,
         TEMP_COOKIE: null,
         PICGO_KEY: process.env.PICGO_KEY || null, //想要流式生图的话需要填入这个PICGO图床的key
